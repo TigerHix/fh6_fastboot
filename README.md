@@ -12,6 +12,8 @@ Drop-in mod that skips Forza Horizon 6's startup wait, the ~25s black screen sho
 
 No launcher or injector. `version.dll` is a system library the game loads; this copy proxies it and forwards its calls to the real one in `System32`.
 
+Already have a `version.dll` from another mod? Rename it to `version_orig.dll`; this loads it alongside the skip.
+
 ## Uninstall
 
 Delete `version.dll` (and `fastboot.ini` / `fastboot.log`).

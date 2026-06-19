@@ -104,21 +104,35 @@ proxies!(
 );
 
 fn init_proxy() {
-    // Load the real version.dll by absolute system path so the loader doesn't
+    // The real version.dll, loaded by absolute system path so the loader doesn't
     // re-resolve to us (infinite recursion).
     let mut buf = [0u16; 320];
     let n = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
-    let mut path: Vec<u16> = buf[..n].to_vec();
-    path.extend("\\version.dll".encode_utf16());
-    path.push(0);
-    let h = unsafe { LoadLibraryW(path.as_ptr()) };
-    if h == 0 {
-        return;
-    }
+    let mut sys: Vec<u16> = buf[..n].to_vec();
+    sys.extend("\\version.dll".encode_utf16());
+    sys.push(0);
+    let h_sys = unsafe { LoadLibraryW(sys.as_ptr()) };
+
+    // Chainload: another version.dll mod renamed to version_orig.dll next to the
+    // game exe. Loading it runs its DllMain; we forward version calls to it
+    // first, falling back to the system version.dll for anything it lacks.
+    let chain = exe_dir().join("version_orig.dll");
+    let h_chain = if chain.exists() {
+        unsafe { LoadLibraryW(wide(&chain.to_string_lossy()).as_ptr()) }
+    } else {
+        0
+    };
+
     for (name, slot) in proxy_init_list() {
         let mut c: Vec<u8> = name.bytes().collect();
         c.push(0);
-        let p = unsafe { GetProcAddress(h, c.as_ptr()) };
+        let mut p = 0usize;
+        if h_chain != 0 {
+            p = unsafe { GetProcAddress(h_chain, c.as_ptr()) };
+        }
+        if p == 0 && h_sys != 0 {
+            p = unsafe { GetProcAddress(h_sys, c.as_ptr()) };
+        }
         slot.store(p, Ordering::SeqCst);
     }
 }
