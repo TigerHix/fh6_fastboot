@@ -2,6 +2,8 @@
 
 Drop-in mod that skips Forza Horizon 6's startup wait, the ~25s black screen shown after the disclaimer/logo. It leaves disk loading untouched, so the game reaches the menu as soon as loading finishes. The skip is automatic; nothing to configure or turn off.
 
+[Download on Nexus Mods](https://www.nexusmods.com/forzahorizon6/mods/522)
+
 ## Install
 
 1. Copy `version.dll` into the game folder, next to `forzahorizon6.exe` (`…\steamapps\common\ForzaHorizon6\`).
