@@ -37,6 +37,9 @@ The offset shifts the clock forward and leaves the rate unchanged, so frame timi
 | `poll_ms` | `80` | Monitor poll interval. |
 | `diag` | `0` | Set `1` for per-poll logging (debugging). |
 | `log` | `1` | Write `fastboot.log` with key events. |
+| `enter_spammer` | `0` | Set `1` to auto-press Enter through the post-skip press-start prompts and drop straight into the game. |
+| `enter_interval_ms` | `120` | Enter interval while spamming. |
+| `enter_window_ms` | `12000` | Stop spamming this long after the skip. |
 
 `F8` toggles the skip at runtime.
 

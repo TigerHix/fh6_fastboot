@@ -10,7 +10,7 @@
 //! timing is unaffected and loading runs at 1x.
 
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicIsize, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -53,6 +53,12 @@ extern "system" {
     fn QueryPerformanceFrequency(f: *mut i64) -> BOOL;
     fn GetAsyncKeyState(vk: i32) -> i16;
     fn Sleep(ms: u32);
+    // enter_spammer: post Enter to the game window to clear the post-skip prompts
+    fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> BOOL;
+    fn EnumWindows(cb: extern "system" fn(isize, isize) -> BOOL, lparam: isize) -> BOOL;
+    fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
+    fn GetCurrentProcessId() -> u32;
+    fn IsWindowVisible(hwnd: isize) -> BOOL;
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -394,6 +400,11 @@ struct Config {
     poll_ms: u32,
     diag: bool,
     log: bool,
+    // After the skip, post Enter to the window on a fast interval to blow through
+    // the post-skip press-start prompts and start the game. Off by default.
+    enter_spammer: bool,
+    enter_interval_ms: i64,
+    enter_window_ms: i64, // stop spamming this long after the skip disarms
 }
 static CFG: OnceLock<Config> = OnceLock::new();
 
@@ -416,6 +427,9 @@ fn load_config() -> Config {
         poll_ms: 80,
         diag: false,
         log: true,
+        enter_spammer: false,
+        enter_interval_ms: 120,
+        enter_window_ms: 12_000,
     };
     if let Ok(txt) = std::fs::read_to_string(exe_dir().join("fastboot.ini")) {
         for line in txt.lines() {
@@ -453,6 +467,19 @@ fn load_config() -> Config {
                     }
                     "diag" => c.diag = v != "0" && !v.eq_ignore_ascii_case("false"),
                     "log" => c.log = v != "0" && !v.eq_ignore_ascii_case("false"),
+                    "enter_spammer" => {
+                        c.enter_spammer = v != "0" && !v.eq_ignore_ascii_case("false")
+                    }
+                    "enter_interval_ms" => {
+                        if let Ok(x) = v.parse() {
+                            c.enter_interval_ms = x;
+                        }
+                    }
+                    "enter_window_ms" => {
+                        if let Ok(x) = v.parse() {
+                            c.enter_window_ms = x;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -473,6 +500,43 @@ fn log(msg: &str) {
     {
         let _ = writeln!(f, "{}", msg);
     }
+}
+
+// ───────────────────────── enter spammer (optional) ─────────────────────────
+// FH6 ignores injected system input (SendInput/keybd_event) but honours window
+// messages, so we post WM_KEYDOWN/UP for Enter straight to the game window.
+const WM_KEYDOWN: u32 = 0x0100;
+const WM_KEYUP: u32 = 0x0101;
+const VK_RETURN: u8 = 0x0D;
+
+static FOUND_HWND: AtomicIsize = AtomicIsize::new(0);
+
+extern "system" fn enum_cb(hwnd: isize, _l: isize) -> BOOL {
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    if pid == unsafe { GetCurrentProcessId() } && unsafe { IsWindowVisible(hwnd) } != 0 {
+        FOUND_HWND.store(hwnd, Ordering::SeqCst);
+        return 0; // stop enumeration
+    }
+    1
+}
+
+fn game_window() -> isize {
+    FOUND_HWND.store(0, Ordering::SeqCst);
+    unsafe { EnumWindows(enum_cb, 0) };
+    FOUND_HWND.load(Ordering::SeqCst)
+}
+
+fn post_key(vk: u16) -> bool {
+    let h = game_window();
+    if h == 0 {
+        return false;
+    }
+    unsafe {
+        PostMessageW(h, WM_KEYDOWN, vk as usize, 0x0000_0001);
+        PostMessageW(h, WM_KEYUP, vk as usize, 0xC000_0001u32 as isize);
+    }
+    true
 }
 
 // ───────────────────────── boot-phase monitor ─────────────────────────
@@ -512,6 +576,12 @@ fn monitor() {
     let mut disabled = false;
     let mut done = false; // disarmed once we're past the gate (menu loading)
     let mut settle = 0u32;
+    // enter_spammer: after the skip disarms, post Enter on a fast interval for a
+    // bounded window to clear the press-start prompts and start the game.
+    let mut disarm_t = 0i64;
+    let mut last_enter_t = 0i64;
+    let mut enters = 0u32;
+    let mut spam_done_logged = false;
     loop {
         unsafe { Sleep(cfg.poll_ms) };
         let t = now_ms();
@@ -568,7 +638,29 @@ fn monitor() {
             settle += 1;
             if settle >= 3 {
                 done = true;
+                disarm_t = t;
                 log(&format!("[{}ms] past gate -> skip disarmed (total +{}ms)", el, total));
+                if cfg.enter_spammer {
+                    log(&format!(
+                        "[{}ms] enter_spammer: Enter every {}ms for {}ms",
+                        el, cfg.enter_interval_ms, cfg.enter_window_ms
+                    ));
+                }
+            }
+        }
+
+        // enter_spammer: post Enter rapidly through the post-skip prompts, then stop.
+        if cfg.enter_spammer && done && !disabled {
+            let since_disarm = t - disarm_t;
+            if since_disarm < cfg.enter_window_ms {
+                if t - last_enter_t >= cfg.enter_interval_ms {
+                    post_key(VK_RETURN as u16);
+                    last_enter_t = t;
+                    enters += 1;
+                }
+            } else if !spam_done_logged {
+                spam_done_logged = true;
+                log(&format!("[{}ms] enter_spammer: done ({} Enter sent)", el, enters));
             }
         }
     }
