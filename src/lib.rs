@@ -808,8 +808,9 @@ fn monitor() {
     const SPIN_MULT: u64 = 2;
     const SPIN_FLOOR: u64 = 50_000;
     const WINDOW: usize = 12; // ~1s read-rate, for the diagnostic log only
-    const CAP: u32 = 6; // max jumps (safety; bounds offset to +180s)
-    const CALM_STOP: u32 = 3; // disarm once the spin has been gone this many polls
+    const CAP: u32 = 16; // max jumps (overflow backstop; normally stops at BinkClose/collapse)
+    const ARM_FALLBACK_MS: i64 = 4000; // arm this long after the intro opens even with no spin
+    const COLLAPSE_STOP: u32 = 3; // done after the spin stays collapsed this many polls
     log(&format!(
         "[fastboot] SKIP v1.3: intro='{}' jump={}ms poll={}ms spin>=max(baseline*{},{})",
         cfg.intro_video, cfg.jump_ms, cfg.poll_ms, SPIN_MULT, SPIN_FLOOR
@@ -832,8 +833,9 @@ fn monitor() {
     let mut last_jump = 0i64; // re-fire cooldown
     let mut peak_dq = 0u64; // diagnostic
     let mut baseline = 0u64; // max dq/poll seen before the intro opened
-    let mut armed = false; // first jump fired
-    let mut calm = 0u32; // consecutive no-spin polls after arming
+    let mut armed = false; // playback started -> begin periodic jumping
+    let mut intro_open_t = 0i64; // when the intro window first opened
+    let mut collapse = 0u32; // consecutive polls with the spin collapsed (post-arm)
     loop {
         unsafe { Sleep(cfg.poll_ms) };
         let t = now_ms();
@@ -877,6 +879,15 @@ fn monitor() {
                 if window_read == u64::MAX { 0 } else { window_read }
             ));
         }
+        // Per-poll trace inside the intro window (until done): shows the bursty
+        // pacing spin and arming so an intermittent miss is fully diagnosable.
+        if INTRO_OPEN.load(Ordering::Relaxed) && !done {
+            log(&format!(
+                "[{}ms] win dq={} thr={} armed={} jumps={} window={}B",
+                el, dq, spin_min, armed as u8, jumps,
+                if window_read == u64::MAX { 0 } else { window_read }
+            ));
+        }
 
         // F8 toggles the skip off/on.
         if (unsafe { GetAsyncKeyState(0x77) } as u16) & 0x8000 != 0 {
@@ -886,21 +897,36 @@ fn monitor() {
         }
 
         // The gate. Act strictly inside the intro video's window (BinkOpen ->
-        // BinkClose) -- that scope, not a disk heuristic, is what excludes menu
-        // and gameplay. Inside it: when the hold's busy-wait is spinning (dq over
-        // the relative threshold), jump the clock past its deadline, re-firing
-        // every 400ms so a wait whose start was captured before we armed still
-        // gets pushed. Stop when the spin collapses for CALM_STOP polls (the hold
-        // is beaten -- the real, hardware-independent terminator), or at BinkClose,
-        // or on the jump cap / timeout safety nets.
+        // BinkClose) -- that scope, not a disk heuristic, excludes menu/gameplay.
+        // Arm on the first spin (busy-wait running = its start is captured) or a
+        // fallback delay; then jump every 400ms UNCONDITIONALLY -- the pacing spin
+        // is bursty and dips below threshold between frames, so a per-jump spin
+        // gate would miss re-fires (verified in field traces). Stop when the spin
+        // stays collapsed (dq under half the arm threshold, the post-hold idle)
+        // for COLLAPSE_STOP polls -- the real hardware-independent terminator --
+        // or at BinkClose, or on the jump-cap / timeout backstops.
         if !done && INTRO_OPEN.load(Ordering::Relaxed) {
-            if spin {
-                calm = 0;
-            } else if armed {
-                calm += 1;
+            if intro_open_t == 0 {
+                intro_open_t = t;
+            }
+            if !armed && (spin || (t - intro_open_t) > ARM_FALLBACK_MS) {
+                armed = true;
+                log(&format!(
+                    "[{}ms] armed (spin={}, {}ms after intro open)",
+                    el, spin as u8, t - intro_open_t
+                ));
+            }
+            // Collapse is tracked only after arming, so a pre-start lull can never
+            // trigger it; dq under half the arm threshold is the post-hold idle.
+            if armed {
+                if dq < spin_min / 2 {
+                    collapse += 1;
+                } else {
+                    collapse = 0;
+                }
             }
             if INTRO_CLOSED.load(Ordering::Relaxed)
-                || (armed && calm >= CALM_STOP)
+                || (armed && collapse >= COLLAPSE_STOP)
                 || jumps >= CAP
                 || el > 90_000
             {
@@ -908,10 +934,10 @@ fn monitor() {
                 disarm_t = t;
                 WATCH_FILES.store(false, Ordering::Relaxed);
                 log(&format!(
-                    "[{}ms] intro window done (closed={}, calm={}, {} jumps, total +{}ms)",
+                    "[{}ms] intro window done (closed={}, collapse={}, {} jumps, total +{}ms)",
                     el,
                     INTRO_CLOSED.load(Ordering::Relaxed) as u8,
-                    calm,
+                    collapse,
                     jumps,
                     total
                 ));
@@ -921,14 +947,13 @@ fn monitor() {
                         el, cfg.enter_interval_ms, cfg.enter_window_ms
                     ));
                 }
-            } else if !disabled && spin && (t - last_jump) > 400 {
+            } else if armed && !disabled && (t - last_jump) > 400 {
                 jump_clock(cfg.jump_ms);
                 jumps += 1;
                 total += cfg.jump_ms;
                 last_jump = t;
-                armed = true;
                 log(&format!(
-                    "[{}ms] GATE dq {}/poll >= thr {} (intro window, window={}B) -> clock +{}ms (total +{}ms, #{})",
+                    "[{}ms] GATE jump (intro window, dq={}, thr={}, window={}B) -> clock +{}ms (total +{}ms, #{})",
                     el, dq, spin_min, window_read, cfg.jump_ms, total, jumps
                 ));
             }
