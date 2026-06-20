@@ -205,6 +205,13 @@ fn jump_clock(ms: i64) {
 type FnQpc = unsafe extern "system" fn(*mut i64) -> i32;
 type FnU64 = unsafe extern "system" fn() -> u64;
 type FnU32 = unsafe extern "system" fn() -> u32;
+type FnCreateW =
+    unsafe extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, isize) -> isize;
+type FnCreateA =
+    unsafe extern "system" fn(*const u8, u32, u32, *const c_void, u32, u32, isize) -> isize;
+type FnBinkOpen = unsafe extern "system" fn(*const u8, u32) -> isize;
+type FnBinkDoFrame = unsafe extern "system" fn(isize) -> i32;
+type FnBinkClose = unsafe extern "system" fn(isize);
 
 // GenericDetour holds raw pointers; we only ever touch the originals through it
 // and the factor state is separately synchronized, so sharing is sound here.
@@ -220,6 +227,13 @@ static QPC: Hook<FnQpc> = Hook::new();
 static GTC64: Hook<FnU64> = Hook::new();
 static GTC: Hook<FnU32> = Hook::new();
 static MM: Hook<FnU32> = Hook::new();
+static CRW: Hook<FnCreateW> = Hook::new();
+static CRA: Hook<FnCreateA> = Hook::new();
+static BKOPEN: Hook<FnBinkOpen> = Hook::new();
+static BKDOF: Hook<FnBinkDoFrame> = Hook::new();
+static BKWAIT: Hook<FnBinkDoFrame> = Hook::new(); // BinkWait: HBINK -> S32
+static BKSHOULD: Hook<FnBinkDoFrame> = Hook::new(); // BinkShouldSkip: HBINK -> S32
+static BKCLOSE: Hook<FnBinkClose> = Hook::new(); // BinkClose: HBINK -> void
 
 fn real_qpc() -> i64 {
     if let Some(d) = QPC.0.get() {
@@ -245,6 +259,21 @@ fn real_mm() -> u32 {
 // path is a counter increment plus the original call.
 static QPC_N: AtomicU64 = AtomicU64::new(0);
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+// Diagnostic file-open probe: START_MS anchors timestamps; WATCH_FILES gates the
+// (per-file-open) inspection to the boot window so it costs nothing in gameplay.
+static START_MS: AtomicI64 = AtomicI64::new(0);
+static WATCH_FILES: AtomicBool = AtomicBool::new(true);
+// Set true when the startup video opens: the hold has begun, so the gate may
+// fire on the spin alone without requiring the disk to be quiet.
+static INTRO_OPEN: AtomicBool = AtomicBool::new(false);
+// Bink playback probe: the intro's HBINK handle, and a bound on how many
+// BinkDoFrame calls we log (the first frame is the real playback start).
+// BinkOpen takes the .bk2 from memory (no filename), so we identify the intro's
+// handle by tagging the first BinkOpen after the intro file's CreateFile.
+static INTRO_HBINK: AtomicIsize = AtomicIsize::new(0);
+static INTRO_FILE_PENDING: AtomicBool = AtomicBool::new(false);
+static INTRO_CLOSED: AtomicBool = AtomicBool::new(false);
+static BKDOF_LOGGED: AtomicU64 = AtomicU64::new(0);
 
 unsafe extern "system" fn hk_qpc(out: *mut i64) -> i32 {
     QPC_N.fetch_add(1, Ordering::Relaxed);
@@ -293,6 +322,149 @@ unsafe extern "system" fn hk_mm() -> u32 {
     }
     let s = &*p;
     scale(real as i64, s.ma, s.mv, s.milli) as u32
+}
+
+// Diagnostic: log when a .bk2 video file is opened, so we can see whether the
+// intro video read coincides with the start of the startup hold. Bounded to the
+// boot window by WATCH_FILES.
+fn note_bk2(name: &str) {
+    if name.len() < 4 {
+        return;
+    }
+    let lower = name.to_ascii_lowercase();
+    if !lower.contains(".bk2") {
+        return;
+    }
+    let el = now_ms() - START_MS.load(Ordering::Relaxed);
+    let base = name.rsplit(['\\', '/']).next().unwrap_or(name);
+    // Identify the intro: its file open tags the next BinkOpen as the intro handle.
+    if let Some(cfg) = CFG.get() {
+        let needle = cfg.intro_video.to_ascii_lowercase();
+        if !needle.is_empty() && lower.contains(&needle) {
+            INTRO_FILE_PENDING.store(true, Ordering::Relaxed);
+            if !INTRO_OPEN.swap(true, Ordering::Relaxed) {
+                log(&format!("[{}ms] intro file opened ({}) -> tagging next BinkOpen", el, base));
+            }
+            return;
+        }
+    }
+    log(&format!("[{}ms] OPEN {}", el, base));
+}
+unsafe extern "system" fn hk_crw(
+    name: *const u16,
+    a: u32,
+    s: u32,
+    sa: *const c_void,
+    d: u32,
+    fl: u32,
+    t: isize,
+) -> isize {
+    if WATCH_FILES.load(Ordering::Relaxed) && !name.is_null() {
+        let mut buf = String::new();
+        let mut i = 0isize;
+        while i < 1024 {
+            let c = *name.offset(i);
+            if c == 0 {
+                break;
+            }
+            buf.push(char::from_u32(c as u32).unwrap_or('?'));
+            i += 1;
+        }
+        note_bk2(&buf);
+    }
+    CRW.0.get().unwrap().call(name, a, s, sa, d, fl, t)
+}
+unsafe extern "system" fn hk_cra(
+    name: *const u8,
+    a: u32,
+    s: u32,
+    sa: *const c_void,
+    d: u32,
+    fl: u32,
+    t: isize,
+) -> isize {
+    if WATCH_FILES.load(Ordering::Relaxed) && !name.is_null() {
+        let mut buf = Vec::new();
+        let mut i = 0isize;
+        while i < 1024 {
+            let c = *name.offset(i);
+            if c == 0 {
+                break;
+            }
+            buf.push(c);
+            i += 1;
+        }
+        note_bk2(&String::from_utf8_lossy(&buf));
+    }
+    CRA.0.get().unwrap().call(name, a, s, sa, d, fl, t)
+}
+
+// Bink probe: BinkOpen tells us the intro's handle and open time; BinkDoFrame's
+// first call is the real playback start (vs the preload-open seen via CreateFile).
+fn boot_window() -> bool {
+    now_ms() - START_MS.load(Ordering::Relaxed) < 120_000
+}
+unsafe extern "system" fn hk_bkopen(name: *const u8, flags: u32) -> isize {
+    let _ = name; // the game opens from memory (BINKFROMMEMORY), so name is not a path
+    let h = BKOPEN.0.get().unwrap().call(name, flags);
+    if boot_window() {
+        let el = now_ms() - START_MS.load(Ordering::Relaxed);
+        // The first BinkOpen after the intro file opened is the intro itself.
+        if INTRO_FILE_PENDING.swap(false, Ordering::Relaxed)
+            && INTRO_HBINK.load(Ordering::Relaxed) == 0
+        {
+            INTRO_HBINK.store(h, Ordering::Relaxed);
+            log(&format!("[{}ms] BinkOpen -> intro handle {:#x} (flags={:#x})", el, h, flags));
+        } else {
+            log(&format!("[{}ms] BinkOpen -> {:#x} (flags={:#x})", el, h, flags));
+        }
+    }
+    h
+}
+unsafe extern "system" fn hk_bkdof(b: isize) -> i32 {
+    if BKDOF_LOGGED.load(Ordering::Relaxed) < 16 && boot_window() {
+        let n = BKDOF_LOGGED.fetch_add(1, Ordering::Relaxed);
+        let el = now_ms() - START_MS.load(Ordering::Relaxed);
+        let tag = if b == INTRO_HBINK.load(Ordering::Relaxed) {
+            " <INTRO>"
+        } else {
+            ""
+        };
+        log(&format!("[{}ms] BinkDoFrame {:#x}{} (#{})", el, b, tag, n + 1));
+    }
+    BKDOF.0.get().unwrap().call(b)
+}
+// BinkWait returns nonzero while it is not yet time for the next frame (the
+// real-time pacing). Forcing 0 for the intro makes the loop rush to the end.
+unsafe extern "system" fn hk_bkwait(b: isize) -> i32 {
+    if b == INTRO_HBINK.load(Ordering::Relaxed)
+        && CFG.get().map(|c| c.bink_wait0).unwrap_or(false)
+    {
+        return 0;
+    }
+    BKWAIT.0.get().unwrap().call(b)
+}
+// BinkShouldSkip asks whether to drop this frame to stay in sync. Forcing 1 for
+// the intro makes the game skip frames (test only; usually black, not shorter).
+unsafe extern "system" fn hk_bkshould(b: isize) -> i32 {
+    if b == INTRO_HBINK.load(Ordering::Relaxed)
+        && CFG.get().map(|c| c.bink_shouldskip).unwrap_or(false)
+    {
+        return 1;
+    }
+    BKSHOULD.0.get().unwrap().call(b)
+}
+// BinkClose marks the end of the intro's lifetime -- the skip window's upper bound.
+unsafe extern "system" fn hk_bkclose(b: isize) {
+    let is_intro = b == INTRO_HBINK.load(Ordering::Relaxed);
+    if is_intro {
+        INTRO_CLOSED.store(true, Ordering::Relaxed);
+    }
+    if boot_window() {
+        let el = now_ms() - START_MS.load(Ordering::Relaxed);
+        log(&format!("[{}ms] BinkClose {:#x}{}", el, b, if is_intro { " <INTRO>" } else { "" }));
+    }
+    BKCLOSE.0.get().unwrap().call(b)
 }
 
 fn resolve(module: &str, name: &[u8]) -> Option<usize> {
@@ -357,6 +529,68 @@ fn install_hooks() {
             }
         }
     }
+    // Diagnostic file-open probe (CreateFileW/A) to time the intro .bk2 read.
+    if let Some(a) = resolve("kernelbase.dll", b"CreateFileW\0")
+        .or_else(|| resolve("kernel32.dll", b"CreateFileW\0"))
+    {
+        unsafe {
+            let t: FnCreateW = core::mem::transmute(a);
+            if let Ok(d) = GenericDetour::<FnCreateW>::new(t, hk_crw) {
+                let _ = CRW.0.set(d);
+            }
+        }
+    }
+    if let Some(a) = resolve("kernelbase.dll", b"CreateFileA\0")
+        .or_else(|| resolve("kernel32.dll", b"CreateFileA\0"))
+    {
+        unsafe {
+            let t: FnCreateA = core::mem::transmute(a);
+            if let Ok(d) = GenericDetour::<FnCreateA>::new(t, hk_cra) {
+                let _ = CRA.0.set(d);
+            }
+        }
+    }
+    // Bink playback probe (bink2w64.dll; loaded on demand if not yet present).
+    if let Some(a) = resolve("bink2w64.dll", b"BinkOpen\0") {
+        unsafe {
+            let t: FnBinkOpen = core::mem::transmute(a);
+            if let Ok(d) = GenericDetour::<FnBinkOpen>::new(t, hk_bkopen) {
+                let _ = BKOPEN.0.set(d);
+            }
+        }
+    }
+    if let Some(a) = resolve("bink2w64.dll", b"BinkDoFrame\0") {
+        unsafe {
+            let t: FnBinkDoFrame = core::mem::transmute(a);
+            if let Ok(d) = GenericDetour::<FnBinkDoFrame>::new(t, hk_bkdof) {
+                let _ = BKDOF.0.set(d);
+            }
+        }
+    }
+    if let Some(a) = resolve("bink2w64.dll", b"BinkWait\0") {
+        unsafe {
+            let t: FnBinkDoFrame = core::mem::transmute(a);
+            if let Ok(d) = GenericDetour::<FnBinkDoFrame>::new(t, hk_bkwait) {
+                let _ = BKWAIT.0.set(d);
+            }
+        }
+    }
+    if let Some(a) = resolve("bink2w64.dll", b"BinkShouldSkip\0") {
+        unsafe {
+            let t: FnBinkDoFrame = core::mem::transmute(a);
+            if let Ok(d) = GenericDetour::<FnBinkDoFrame>::new(t, hk_bkshould) {
+                let _ = BKSHOULD.0.set(d);
+            }
+        }
+    }
+    if let Some(a) = resolve("bink2w64.dll", b"BinkClose\0") {
+        unsafe {
+            let t: FnBinkClose = core::mem::transmute(a);
+            if let Ok(d) = GenericDetour::<FnBinkClose>::new(t, hk_bkclose) {
+                let _ = BKCLOSE.0.set(d);
+            }
+        }
+    }
 
     // Initialize the clock at 1x (virtual == real) before enabling hooks.
     let q = real_qpc();
@@ -374,6 +608,7 @@ fn install_hooks() {
         ma: m,
         mv: m,
     });
+    START_MS.store(now_ms(), Ordering::SeqCst);
 
     unsafe {
         if let Some(d) = QPC.0.get() {
@@ -388,18 +623,41 @@ fn install_hooks() {
         if let Some(d) = MM.0.get() {
             let _ = d.enable();
         }
+        if let Some(d) = CRW.0.get() {
+            let _ = d.enable();
+        }
+        if let Some(d) = CRA.0.get() {
+            let _ = d.enable();
+        }
+        if let Some(d) = BKOPEN.0.get() {
+            let _ = d.enable();
+        }
+        if let Some(d) = BKDOF.0.get() {
+            let _ = d.enable();
+        }
+        if let Some(d) = BKWAIT.0.get() {
+            let _ = d.enable();
+        }
+        if let Some(d) = BKSHOULD.0.get() {
+            let _ = d.enable();
+        }
+        if let Some(d) = BKCLOSE.0.get() {
+            let _ = d.enable();
+        }
     }
 }
 
 // ───────────────────────── config + logging ─────────────────────────
 struct Config {
-    qpc_spin_min: u64,
-    quiet_window_polls: u32,
-    quiet_bytes: u64,
     jump_ms: i64,
     poll_ms: u32,
-    diag: bool,
-    log: bool,
+    // The startup video filename (substring) used to identify the intro's Bink
+    // handle. Bink experiment toggles act only on that handle:
+    //   bink_wait0      force BinkWait -> "ready" so playback rushes to the end
+    //   bink_shouldskip force BinkShouldSkip -> "skip frame" (drops display)
+    intro_video: String,
+    bink_wait0: bool,
+    bink_shouldskip: bool,
     // After the skip, post Enter to the window on a fast interval to blow through
     // the post-skip press-start prompts and start the game. Off by default.
     enter_spammer: bool,
@@ -420,13 +678,11 @@ fn exe_dir() -> PathBuf {
 
 fn load_config() -> Config {
     let mut c = Config {
-        qpc_spin_min: 500_000,
-        quiet_window_polls: 12, // ~1s at poll_ms=80
-        quiet_bytes: 6_000_000, // <6MB read over the window = "disk quiet"
         jump_ms: 30_000,
         poll_ms: 80,
-        diag: false,
-        log: true,
+        intro_video: "T10_MS_Combined".to_string(),
+        bink_wait0: false,
+        bink_shouldskip: false,
         enter_spammer: false,
         enter_interval_ms: 120,
         enter_window_ms: 12_000,
@@ -440,21 +696,6 @@ fn load_config() -> Config {
             if let Some((k, v)) = line.split_once('=') {
                 let (k, v) = (k.trim(), v.trim());
                 match k {
-                    "qpc_spin_min" => {
-                        if let Ok(x) = v.parse() {
-                            c.qpc_spin_min = x;
-                        }
-                    }
-                    "quiet_window_polls" => {
-                        if let Ok(x) = v.parse() {
-                            c.quiet_window_polls = x;
-                        }
-                    }
-                    "quiet_bytes" => {
-                        if let Ok(x) = v.parse() {
-                            c.quiet_bytes = x;
-                        }
-                    }
                     "jump_ms" => {
                         if let Ok(x) = v.parse() {
                             c.jump_ms = x;
@@ -465,8 +706,11 @@ fn load_config() -> Config {
                             c.poll_ms = x;
                         }
                     }
-                    "diag" => c.diag = v != "0" && !v.eq_ignore_ascii_case("false"),
-                    "log" => c.log = v != "0" && !v.eq_ignore_ascii_case("false"),
+                    "intro_video" => c.intro_video = v.to_string(),
+                    "bink_wait0" => c.bink_wait0 = v != "0" && !v.eq_ignore_ascii_case("false"),
+                    "bink_shouldskip" => {
+                        c.bink_shouldskip = v != "0" && !v.eq_ignore_ascii_case("false")
+                    }
                     "enter_spammer" => {
                         c.enter_spammer = v != "0" && !v.eq_ignore_ascii_case("false")
                     }
@@ -489,9 +733,6 @@ fn load_config() -> Config {
 }
 
 fn log(msg: &str) {
-    if !CFG.get().map(|c| c.log).unwrap_or(true) {
-        return;
-    }
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -560,28 +801,39 @@ fn read_bytes() -> u64 {
 // we add a clock offset past the gate's deadline, once per gate.
 fn monitor() {
     let cfg = CFG.get().unwrap();
-    let w = (cfg.quiet_window_polls as usize).clamp(2, 31);
+    // Relative spin trigger: the hold's busy-wait spins QueryPerformanceCounter
+    // far faster than the pre-intro loading code, and both scale with CPU speed,
+    // so we arm when dq exceeds (pre-intro peak * SPIN_MULT), floored. No fixed
+    // hardware-tuned threshold -- it auto-scales to slow and fast CPUs alike.
+    const SPIN_MULT: u64 = 2;
+    const SPIN_FLOOR: u64 = 50_000;
+    const WINDOW: usize = 12; // ~1s read-rate, for the diagnostic log only
+    const CAP: u32 = 6; // max jumps (safety; bounds offset to +180s)
+    const CALM_STOP: u32 = 3; // disarm once the spin has been gone this many polls
     log(&format!(
-        "[fastboot] SKIP: spin_min={}/poll quiet<{}B over {}polls jump={}ms poll={}ms",
-        cfg.qpc_spin_min, cfg.quiet_bytes, w, cfg.jump_ms, cfg.poll_ms
+        "[fastboot] SKIP v1.3: intro='{}' jump={}ms poll={}ms spin>=max(baseline*{},{})",
+        cfg.intro_video, cfg.jump_ms, cfg.poll_ms, SPIN_MULT, SPIN_FLOOR
     ));
     let t0 = now_ms();
     let mut pq = QPC_N.load(Ordering::Relaxed);
-    // ring of cumulative-read samples -> rolling read total over the last `w` polls
-    let mut ring = [0u64; 32];
+    let mut ring = [0u64; 32]; // cumulative-read samples -> rolling read total (diagnostic)
     let mut ri = 0usize;
     let mut filled = 0usize;
     let mut jumps = 0u32;
     let mut total = 0i64;
     let mut disabled = false;
-    let mut done = false; // disarmed once we're past the gate (menu loading)
-    let mut settle = 0u32;
-    // enter_spammer: after the skip disarms, post Enter on a fast interval for a
-    // bounded window to clear the press-start prompts and start the game.
+    let mut done = false;
+    // enter_spammer: after the skip, post Enter on a fast interval for a bounded
+    // window to clear the press-start prompts and start the game.
     let mut disarm_t = 0i64;
     let mut last_enter_t = 0i64;
     let mut enters = 0u32;
     let mut spam_done_logged = false;
+    let mut last_jump = 0i64; // re-fire cooldown
+    let mut peak_dq = 0u64; // diagnostic
+    let mut baseline = 0u64; // max dq/poll seen before the intro opened
+    let mut armed = false; // first jump fired
+    let mut calm = 0u32; // consecutive no-spin polls after arming
     loop {
         unsafe { Sleep(cfg.poll_ms) };
         let t = now_ms();
@@ -592,60 +844,93 @@ fn monitor() {
         let dq = q.wrapping_sub(pq);
         pq = q;
 
-        // rolling disk-read total over the trailing `w` polls (~1s). Load-size
-        // independent: it measures whether the disk has gone quiet.
-        let ago = ring[(ri + 32 - w) % 32];
-        let window_read = if filled >= w { cum.wrapping_sub(ago) } else { u64::MAX };
+        // rolling disk-read total over the trailing WINDOW polls (~1s) -- kept for
+        // the diagnostic log only (distinguishes "missed hold" from "no hold").
+        let ago = ring[(ri + 32 - WINDOW) % 32];
+        let window_read = if filled >= WINDOW { cum.wrapping_sub(ago) } else { u64::MAX };
         ring[ri] = cum;
         ri = (ri + 1) % 32;
         if filled < 32 {
             filled += 1;
         }
-        let quiet = window_read < cfg.quiet_bytes;
-        let spin = dq > cfg.qpc_spin_min;
+        // Before the intro opens, the highest QPC rate we see is loading code;
+        // the hold spins well above it. Arm relative to that baseline.
+        if !INTRO_OPEN.load(Ordering::Relaxed) && dq > baseline {
+            baseline = dq;
+        }
+        let spin_min = baseline.saturating_mul(SPIN_MULT).max(SPIN_FLOOR);
+        let spin = dq >= spin_min;
 
-        if cfg.diag {
+        // Stop the file-open probe if no gate ever fires (bounds gameplay cost).
+        if WATCH_FILES.load(Ordering::Relaxed) && el > 180_000 {
+            WATCH_FILES.store(false, Ordering::Relaxed);
+        }
+
+        // Compact always-on diagnostic: each new spin peak, with the current
+        // relative threshold and disk read-rate, so a field log shows whether the
+        // hold crossed the bar and what the disk was doing.
+        if dq > 200_000 && dq > peak_dq {
+            peak_dq = dq;
             log(&format!(
-                "D {:>6} win={:>11} qpc={:>8} quiet={} spin={}",
-                el,
-                if window_read == u64::MAX { 0 } else { window_read },
-                dq,
-                quiet as u8,
-                spin as u8
+                "[{}ms] spin peak {}/poll (thr={}, window={}B)",
+                el, dq, spin_min,
+                if window_read == u64::MAX { 0 } else { window_read }
             ));
         }
 
         // F8 toggles the skip off/on.
         if (unsafe { GetAsyncKeyState(0x77) } as u16) & 0x8000 != 0 {
             disabled = !disabled;
-            log(&format!("[{}ms] F8 -> skip {}", t, if disabled { "OFF" } else { "ON" }));
+            log(&format!("[{}ms] F8 -> skip {}", el, if disabled { "OFF" } else { "ON" }));
             unsafe { Sleep(300) }; // debounce
         }
 
-        // The gate: a QPC spin while the disk has gone quiet (load finished).
-        if !disabled && !done && spin && quiet {
-            jump_clock(cfg.jump_ms);
-            jumps += 1;
-            total += cfg.jump_ms;
-            settle = 0;
-            log(&format!(
-                "[{}ms] GATE spin {}/poll, disk quiet ({}B/{}polls) -> clock +{}ms (total +{}ms, #{})",
-                el, dq, window_read, w, cfg.jump_ms, total, jumps
-            ));
-        } else if jumps > 0 && !done {
-            // Past the gate: once the spin-while-quiet stops (menu loading /
-            // rendering), disarm so the menu's own render loop can't retrigger.
-            settle += 1;
-            if settle >= 3 {
+        // The gate. Act strictly inside the intro video's window (BinkOpen ->
+        // BinkClose) -- that scope, not a disk heuristic, is what excludes menu
+        // and gameplay. Inside it: when the hold's busy-wait is spinning (dq over
+        // the relative threshold), jump the clock past its deadline, re-firing
+        // every 400ms so a wait whose start was captured before we armed still
+        // gets pushed. Stop when the spin collapses for CALM_STOP polls (the hold
+        // is beaten -- the real, hardware-independent terminator), or at BinkClose,
+        // or on the jump cap / timeout safety nets.
+        if !done && INTRO_OPEN.load(Ordering::Relaxed) {
+            if spin {
+                calm = 0;
+            } else if armed {
+                calm += 1;
+            }
+            if INTRO_CLOSED.load(Ordering::Relaxed)
+                || (armed && calm >= CALM_STOP)
+                || jumps >= CAP
+                || el > 90_000
+            {
                 done = true;
                 disarm_t = t;
-                log(&format!("[{}ms] past gate -> skip disarmed (total +{}ms)", el, total));
+                WATCH_FILES.store(false, Ordering::Relaxed);
+                log(&format!(
+                    "[{}ms] intro window done (closed={}, calm={}, {} jumps, total +{}ms)",
+                    el,
+                    INTRO_CLOSED.load(Ordering::Relaxed) as u8,
+                    calm,
+                    jumps,
+                    total
+                ));
                 if cfg.enter_spammer {
                     log(&format!(
                         "[{}ms] enter_spammer: Enter every {}ms for {}ms",
                         el, cfg.enter_interval_ms, cfg.enter_window_ms
                     ));
                 }
+            } else if !disabled && spin && (t - last_jump) > 400 {
+                jump_clock(cfg.jump_ms);
+                jumps += 1;
+                total += cfg.jump_ms;
+                last_jump = t;
+                armed = true;
+                log(&format!(
+                    "[{}ms] GATE dq {}/poll >= thr {} (intro window, window={}B) -> clock +{}ms (total +{}ms, #{})",
+                    el, dq, spin_min, window_read, cfg.jump_ms, total, jumps
+                ));
             }
         }
 
