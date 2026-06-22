@@ -210,8 +210,7 @@ type FnCreateW =
 type FnCreateA =
     unsafe extern "system" fn(*const u8, u32, u32, *const c_void, u32, u32, isize) -> isize;
 type FnBinkOpen = unsafe extern "system" fn(*const u8, u32) -> isize;
-type FnBinkDoFrame = unsafe extern "system" fn(isize) -> i32;
-type FnBinkClose = unsafe extern "system" fn(isize);
+type FnBinkClose = unsafe extern "system" fn(isize); // BinkClose: void(HBINK)
 
 // GenericDetour holds raw pointers; we only ever touch the originals through it
 // and the factor state is separately synchronized, so sharing is sound here.
@@ -229,11 +228,8 @@ static GTC: Hook<FnU32> = Hook::new();
 static MM: Hook<FnU32> = Hook::new();
 static CRW: Hook<FnCreateW> = Hook::new();
 static CRA: Hook<FnCreateA> = Hook::new();
-static BKOPEN: Hook<FnBinkOpen> = Hook::new();
-static BKDOF: Hook<FnBinkDoFrame> = Hook::new();
-static BKWAIT: Hook<FnBinkDoFrame> = Hook::new(); // BinkWait: HBINK -> S32
-static BKSHOULD: Hook<FnBinkDoFrame> = Hook::new(); // BinkShouldSkip: HBINK -> S32
-static BKCLOSE: Hook<FnBinkClose> = Hook::new(); // BinkClose: HBINK -> void
+static BKOPEN: Hook<FnBinkOpen> = Hook::new(); // BinkOpen: tag the intro handle
+static BKCLOSE: Hook<FnBinkClose> = Hook::new(); // BinkClose: end of the intro window
 
 fn real_qpc() -> i64 {
     if let Some(d) = QPC.0.get() {
@@ -266,14 +262,12 @@ static WATCH_FILES: AtomicBool = AtomicBool::new(true);
 // Set true when the startup video opens: the hold has begun, so the gate may
 // fire on the spin alone without requiring the disk to be quiet.
 static INTRO_OPEN: AtomicBool = AtomicBool::new(false);
-// Bink playback probe: the intro's HBINK handle, and a bound on how many
-// BinkDoFrame calls we log (the first frame is the real playback start).
-// BinkOpen takes the .bk2 from memory (no filename), so we identify the intro's
-// handle by tagging the first BinkOpen after the intro file's CreateFile.
+// The intro's HBINK handle. BinkOpen takes the .bk2 from memory (no filename),
+// so we tag the first BinkOpen after the intro file's CreateFile as the intro,
+// and watch its BinkClose to bound the skip window.
 static INTRO_HBINK: AtomicIsize = AtomicIsize::new(0);
 static INTRO_FILE_PENDING: AtomicBool = AtomicBool::new(false);
 static INTRO_CLOSED: AtomicBool = AtomicBool::new(false);
-static BKDOF_LOGGED: AtomicU64 = AtomicU64::new(0);
 
 unsafe extern "system" fn hk_qpc(out: *mut i64) -> i32 {
     QPC_N.fetch_add(1, Ordering::Relaxed);
@@ -399,11 +393,12 @@ unsafe extern "system" fn hk_cra(
     CRA.0.get().unwrap().call(name, a, s, sa, d, fl, t)
 }
 
-// Bink probe: BinkOpen tells us the intro's handle and open time; BinkDoFrame's
-// first call is the real playback start (vs the preload-open seen via CreateFile).
+// Boot window: bound the file/Bink logging to startup so it costs nothing later.
 fn boot_window() -> bool {
     now_ms() - START_MS.load(Ordering::Relaxed) < 120_000
 }
+// BinkOpen: the first call after the intro .bk2 file opened is the intro itself,
+// so we tag its handle. (The handle's BinkClose then bounds the skip window.)
 unsafe extern "system" fn hk_bkopen(name: *const u8, flags: u32) -> isize {
     let _ = name; // the game opens from memory (BINKFROMMEMORY), so name is not a path
     let h = BKOPEN.0.get().unwrap().call(name, flags);
@@ -420,39 +415,6 @@ unsafe extern "system" fn hk_bkopen(name: *const u8, flags: u32) -> isize {
         }
     }
     h
-}
-unsafe extern "system" fn hk_bkdof(b: isize) -> i32 {
-    if BKDOF_LOGGED.load(Ordering::Relaxed) < 16 && boot_window() {
-        let n = BKDOF_LOGGED.fetch_add(1, Ordering::Relaxed);
-        let el = now_ms() - START_MS.load(Ordering::Relaxed);
-        let tag = if b == INTRO_HBINK.load(Ordering::Relaxed) {
-            " <INTRO>"
-        } else {
-            ""
-        };
-        log(&format!("[{}ms] BinkDoFrame {:#x}{} (#{})", el, b, tag, n + 1));
-    }
-    BKDOF.0.get().unwrap().call(b)
-}
-// BinkWait returns nonzero while it is not yet time for the next frame (the
-// real-time pacing). Forcing 0 for the intro makes the loop rush to the end.
-unsafe extern "system" fn hk_bkwait(b: isize) -> i32 {
-    if b == INTRO_HBINK.load(Ordering::Relaxed)
-        && CFG.get().map(|c| c.bink_wait0).unwrap_or(false)
-    {
-        return 0;
-    }
-    BKWAIT.0.get().unwrap().call(b)
-}
-// BinkShouldSkip asks whether to drop this frame to stay in sync. Forcing 1 for
-// the intro makes the game skip frames (test only; usually black, not shorter).
-unsafe extern "system" fn hk_bkshould(b: isize) -> i32 {
-    if b == INTRO_HBINK.load(Ordering::Relaxed)
-        && CFG.get().map(|c| c.bink_shouldskip).unwrap_or(false)
-    {
-        return 1;
-    }
-    BKSHOULD.0.get().unwrap().call(b)
 }
 // BinkClose marks the end of the intro's lifetime -- the skip window's upper bound.
 unsafe extern "system" fn hk_bkclose(b: isize) {
@@ -550,36 +512,13 @@ fn install_hooks() {
             }
         }
     }
-    // Bink playback probe (bink2w64.dll; loaded on demand if not yet present).
+    // Bink window hooks (bink2w64.dll; loaded on demand if not yet present): the
+    // intro's BinkOpen/BinkClose bound the skip window.
     if let Some(a) = resolve("bink2w64.dll", b"BinkOpen\0") {
         unsafe {
             let t: FnBinkOpen = core::mem::transmute(a);
             if let Ok(d) = GenericDetour::<FnBinkOpen>::new(t, hk_bkopen) {
                 let _ = BKOPEN.0.set(d);
-            }
-        }
-    }
-    if let Some(a) = resolve("bink2w64.dll", b"BinkDoFrame\0") {
-        unsafe {
-            let t: FnBinkDoFrame = core::mem::transmute(a);
-            if let Ok(d) = GenericDetour::<FnBinkDoFrame>::new(t, hk_bkdof) {
-                let _ = BKDOF.0.set(d);
-            }
-        }
-    }
-    if let Some(a) = resolve("bink2w64.dll", b"BinkWait\0") {
-        unsafe {
-            let t: FnBinkDoFrame = core::mem::transmute(a);
-            if let Ok(d) = GenericDetour::<FnBinkDoFrame>::new(t, hk_bkwait) {
-                let _ = BKWAIT.0.set(d);
-            }
-        }
-    }
-    if let Some(a) = resolve("bink2w64.dll", b"BinkShouldSkip\0") {
-        unsafe {
-            let t: FnBinkDoFrame = core::mem::transmute(a);
-            if let Ok(d) = GenericDetour::<FnBinkDoFrame>::new(t, hk_bkshould) {
-                let _ = BKSHOULD.0.set(d);
             }
         }
     }
@@ -632,15 +571,6 @@ fn install_hooks() {
         if let Some(d) = BKOPEN.0.get() {
             let _ = d.enable();
         }
-        if let Some(d) = BKDOF.0.get() {
-            let _ = d.enable();
-        }
-        if let Some(d) = BKWAIT.0.get() {
-            let _ = d.enable();
-        }
-        if let Some(d) = BKSHOULD.0.get() {
-            let _ = d.enable();
-        }
         if let Some(d) = BKCLOSE.0.get() {
             let _ = d.enable();
         }
@@ -652,12 +582,8 @@ struct Config {
     jump_ms: i64,
     poll_ms: u32,
     // The startup video filename (substring) used to identify the intro's Bink
-    // handle. Bink experiment toggles act only on that handle:
-    //   bink_wait0      force BinkWait -> "ready" so playback rushes to the end
-    //   bink_shouldskip force BinkShouldSkip -> "skip frame" (drops display)
+    // handle; the skip is scoped to that handle's BinkOpen -> BinkClose window.
     intro_video: String,
-    bink_wait0: bool,
-    bink_shouldskip: bool,
     // After the skip, post Enter to the window on a fast interval to blow through
     // the post-skip press-start prompts and start the game. Off by default.
     enter_spammer: bool,
@@ -681,8 +607,6 @@ fn load_config() -> Config {
         jump_ms: 30_000,
         poll_ms: 80,
         intro_video: "T10_MS_Combined".to_string(),
-        bink_wait0: false,
-        bink_shouldskip: false,
         enter_spammer: false,
         enter_interval_ms: 120,
         enter_window_ms: 12_000,
@@ -707,10 +631,6 @@ fn load_config() -> Config {
                         }
                     }
                     "intro_video" => c.intro_video = v.to_string(),
-                    "bink_wait0" => c.bink_wait0 = v != "0" && !v.eq_ignore_ascii_case("false"),
-                    "bink_shouldskip" => {
-                        c.bink_shouldskip = v != "0" && !v.eq_ignore_ascii_case("false")
-                    }
                     "enter_spammer" => {
                         c.enter_spammer = v != "0" && !v.eq_ignore_ascii_case("false")
                     }
@@ -808,11 +728,10 @@ fn monitor() {
     const SPIN_MULT: u64 = 2;
     const SPIN_FLOOR: u64 = 50_000;
     const WINDOW: usize = 12; // ~1s read-rate, for the diagnostic log only
-    const CAP: u32 = 16; // max jumps (overflow backstop; normally stops at BinkClose/collapse)
-    const ARM_FALLBACK_MS: i64 = 4000; // arm this long after the intro opens even with no spin
-    const COLLAPSE_STOP: u32 = 3; // done after the spin stays collapsed this many polls
+    const CAP: u32 = 8; // total-jump ceiling (bounds banked offset; normally 1-3)
+    const COLLAPSE_STOP: u32 = 3; // disarm/done after the spin stays collapsed this many polls
     log(&format!(
-        "[fastboot] SKIP v1.3: intro='{}' jump={}ms poll={}ms spin>=max(baseline*{},{})",
+        "[fastboot] SKIP v1.3.1: intro='{}' jump={}ms poll={}ms spin>=max(baseline*{},{})",
         cfg.intro_video, cfg.jump_ms, cfg.poll_ms, SPIN_MULT, SPIN_FLOOR
     ));
     let t0 = now_ms();
@@ -822,7 +741,6 @@ fn monitor() {
     let mut filled = 0usize;
     let mut jumps = 0u32;
     let mut total = 0i64;
-    let mut disabled = false;
     let mut done = false;
     // enter_spammer: after the skip, post Enter on a fast interval for a bounded
     // window to clear the press-start prompts and start the game.
@@ -834,8 +752,10 @@ fn monitor() {
     let mut peak_dq = 0u64; // diagnostic
     let mut baseline = 0u64; // max dq/poll seen before the intro opened
     let mut armed = false; // playback started -> begin periodic jumping
+    let mut arm_pending = false; // a spin spike awaiting next-poll confirmation
     let mut intro_open_t = 0i64; // when the intro window first opened
     let mut collapse = 0u32; // consecutive polls with the spin collapsed (post-arm)
+    let mut cycle_jumps = 0u32; // jumps landed in the current arm cycle (reset on each arm)
     loop {
         unsafe { Sleep(cfg.poll_ms) };
         let t = now_ms();
@@ -889,57 +809,39 @@ fn monitor() {
             ));
         }
 
-        // F8 toggles the skip off/on.
+        // F8: manual skip. Each press jumps the clock now, collapsing whatever
+        // timed wait is on screen -- a hands-on fallback if auto-skip ever misses
+        // and the intro is playing. Works regardless of armed/done state.
         if (unsafe { GetAsyncKeyState(0x77) } as u16) & 0x8000 != 0 {
-            disabled = !disabled;
-            log(&format!("[{}ms] F8 -> skip {}", el, if disabled { "OFF" } else { "ON" }));
-            unsafe { Sleep(300) }; // debounce
+            jump_clock(cfg.jump_ms);
+            total += cfg.jump_ms;
+            log(&format!("[{}ms] F8 -> manual skip (clock +{}ms, total +{}ms)", el, cfg.jump_ms, total));
+            unsafe { Sleep(200) }; // debounce
         }
 
         // The gate. Act strictly inside the intro video's window (BinkOpen ->
         // BinkClose) -- that scope, not a disk heuristic, excludes menu/gameplay.
-        // Arm on the first spin (busy-wait running = its start is captured) or a
-        // fallback delay; then jump every 400ms UNCONDITIONALLY -- the pacing spin
-        // is bursty and dips below threshold between frames, so a per-jump spin
-        // gate would miss re-fires (verified in field traces). Stop when the spin
-        // stays collapsed (dq under half the arm threshold, the post-hold idle)
-        // for COLLAPSE_STOP polls -- the real hardware-independent terminator --
-        // or at BinkClose, or on the jump-cap / timeout backstops.
+        // Then jump every 400ms UNCONDITIONALLY -- the pacing spin is bursty and
+        // dips below threshold between frames, so a per-jump spin gate would miss
+        // re-fires (verified in field traces). Stop when the spin stays collapsed
+        // for COLLAPSE_STOP polls, or at BinkClose, or on the jump-cap / timeout.
         if !done && INTRO_OPEN.load(Ordering::Relaxed) {
             if intro_open_t == 0 {
                 intro_open_t = t;
             }
-            if !armed && (spin || (t - intro_open_t) > ARM_FALLBACK_MS) {
-                armed = true;
-                log(&format!(
-                    "[{}ms] armed (spin={}, {}ms after intro open)",
-                    el, spin as u8, t - intro_open_t
-                ));
-            }
-            // Collapse is tracked only after arming, so a pre-start lull can never
-            // trigger it; dq under half the arm threshold is the post-hold idle.
-            if armed {
-                if dq < spin_min / 2 {
-                    collapse += 1;
-                } else {
-                    collapse = 0;
-                }
-            }
-            if INTRO_CLOSED.load(Ordering::Relaxed)
-                || (armed && collapse >= COLLAPSE_STOP)
-                || jumps >= CAP
-                || el > 90_000
-            {
+            // Done is latched only when the intro video actually ends (BinkClose),
+            // or on the safety backstops. NOT on a spin collapse -- a pre-playback
+            // transient collapses too, and the real hold can start right after it.
+            // BinkClose only ends us if we actually jumped (a 0-jump close is an
+            // early/mistagged handle, not our skip). Effective-collapse (below) is
+            // the primary stop; cap/timeout are backstops.
+            if (INTRO_CLOSED.load(Ordering::Relaxed) && jumps >= 1) || jumps >= CAP || el > 90_000 {
                 done = true;
                 disarm_t = t;
                 WATCH_FILES.store(false, Ordering::Relaxed);
                 log(&format!(
-                    "[{}ms] intro window done (closed={}, collapse={}, {} jumps, total +{}ms)",
-                    el,
-                    INTRO_CLOSED.load(Ordering::Relaxed) as u8,
-                    collapse,
-                    jumps,
-                    total
+                    "[{}ms] intro window done (closed={}, {} jumps, total +{}ms)",
+                    el, INTRO_CLOSED.load(Ordering::Relaxed) as u8, jumps, total
                 ));
                 if cfg.enter_spammer {
                     log(&format!(
@@ -947,20 +849,71 @@ fn monitor() {
                         el, cfg.enter_interval_ms, cfg.enter_window_ms
                     ));
                 }
-            } else if armed && !disabled && (t - last_jump) > 400 {
-                jump_clock(cfg.jump_ms);
-                jumps += 1;
-                total += cfg.jump_ms;
-                last_jump = t;
-                log(&format!(
-                    "[{}ms] GATE jump (intro window, dq={}, thr={}, window={}B) -> clock +{}ms (total +{}ms, #{})",
-                    el, dq, spin_min, window_read, cfg.jump_ms, total, jumps
-                ));
+            } else {
+                // Arm when a spin spike is confirmed by the next poll still active.
+                // Purely relative to this boot's own rate -- no time/clock constant.
+                if !armed {
+                    let active = dq >= spin_min / 2;
+                    if arm_pending && active {
+                        armed = true;
+                        collapse = 0;
+                        cycle_jumps = 0;
+                        last_jump = t; // first jump fires one cadence later, not now,
+                                       // so a sub-400ms transient never lands a jump
+                        log(&format!("[{}ms] armed ({}ms after intro open)", el, t - intro_open_t));
+                    } else {
+                        arm_pending = spin;
+                    }
+                }
+                if armed {
+                    if dq < spin_min / 2 {
+                        collapse += 1;
+                    } else {
+                        collapse = 0;
+                    }
+                    if collapse >= COLLAPSE_STOP {
+                        if cycle_jumps >= 1 {
+                            // We landed a jump on a running hold and it then
+                            // collapsed: a genuine skip. Stop for good, independent
+                            // of BinkClose (so the menu render can't re-arm us).
+                            done = true;
+                            disarm_t = t;
+                            WATCH_FILES.store(false, Ordering::Relaxed);
+                            log(&format!(
+                                "[{}ms] intro window done (collapsed after {} jumps, total +{}ms)",
+                                el, cycle_jumps, total
+                            ));
+                            if cfg.enter_spammer {
+                                log(&format!(
+                                    "[{}ms] enter_spammer: Enter every {}ms for {}ms",
+                                    el, cfg.enter_interval_ms, cfg.enter_window_ms
+                                ));
+                            }
+                        } else {
+                            // Armed on a transient that vanished before any jump
+                            // landed -> not the hold. Disarm and stay re-armable.
+                            armed = false;
+                            arm_pending = false;
+                            collapse = 0;
+                            log(&format!("[{}ms] disarmed (transient, no jump landed -> re-armable)", el));
+                        }
+                    } else if (t - last_jump) > 400 {
+                        jump_clock(cfg.jump_ms);
+                        jumps += 1;
+                        cycle_jumps += 1;
+                        total += cfg.jump_ms;
+                        last_jump = t;
+                        log(&format!(
+                            "[{}ms] GATE jump (intro window, dq={}, thr={}, window={}B) -> +{}ms (total +{}ms, #{})",
+                            el, dq, spin_min, window_read, cfg.jump_ms, total, jumps
+                        ));
+                    }
+                }
             }
         }
 
         // enter_spammer: post Enter rapidly through the post-skip prompts, then stop.
-        if cfg.enter_spammer && done && !disabled {
+        if cfg.enter_spammer && done {
             let since_disarm = t - disarm_t;
             if since_disarm < cfg.enter_window_ms {
                 if t - last_enter_t >= cfg.enter_interval_ms {

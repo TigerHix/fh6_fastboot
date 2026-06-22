@@ -37,7 +37,7 @@ The offset shifts the clock forward and leaves the rate unchanged, so frame timi
 | `enter_interval_ms` | `120` | Enter interval while spamming. |
 | `enter_window_ms` | `12000` | Stop spamming this long after the skip. |
 
-The spin threshold is auto-calibrated per machine, so there is nothing disk- or CPU-specific to tune. `F8` toggles the skip at runtime. The mod always writes a small `fastboot.log` (spin peaks, gate, disarm); delete it anytime.
+The spin threshold is auto-calibrated per machine, so there is nothing disk- or CPU-specific to tune. `F8` is a manual skip: press it to collapse the intro on the spot (a hands-on fallback if the automatic skip ever misses). The mod always writes a small `fastboot.log` (spin peaks, gate, disarm); delete it anytime.
 
 ## Build
 
